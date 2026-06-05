@@ -14,6 +14,13 @@ use turbopath::{AbsoluteSystemPath, RelativeUnixPathBuf};
 use turborepo_errors::{ParseDiagnostic, Spanned, WithMetadata};
 use turborepo_unescape::UnescapedString;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyKind {
+    Normal,
+    Peer,
+    OptionalPeer,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PackageJson {
@@ -31,6 +38,8 @@ pub struct PackageJson {
     pub optional_dependencies: Option<BTreeMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_dependencies: Option<BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_dependencies_meta: Option<BTreeMap<String, PeerDependencyMeta>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub scripts: BTreeMap<String, Spanned<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -54,6 +63,16 @@ pub struct PnpmConfig {
     pub other: BTreeMap<String, serde_json::Value>,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerDependencyMeta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub optional: Option<bool>,
+    // Unstructured fields kept for round trip capabilities
+    #[serde(flatten)]
+    pub other: BTreeMap<String, serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserializable)]
 pub struct RawPackageJson {
     pub name: Option<Spanned<UnescapedString>>,
@@ -63,6 +82,7 @@ pub struct RawPackageJson {
     pub dev_dependencies: Option<BTreeMap<String, UnescapedString>>,
     pub optional_dependencies: Option<BTreeMap<String, UnescapedString>>,
     pub peer_dependencies: Option<BTreeMap<String, UnescapedString>>,
+    pub peer_dependencies_meta: Option<BTreeMap<String, RawPeerDependencyMeta>>,
     pub scripts: BTreeMap<String, Spanned<UnescapedString>>,
     pub resolutions: Option<BTreeMap<String, UnescapedString>>,
     pub pnpm: Option<RawPnpmConfig>,
@@ -76,6 +96,14 @@ pub struct RawPackageJson {
 pub struct RawPnpmConfig {
     pub patched_dependencies: Option<BTreeMap<String, RelativeUnixPathBuf>>,
     // Unstructured config options kept for round trip capabilities
+    #[deserializable(rest)]
+    pub other: BTreeMap<Text, serde_json::Value>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserializable)]
+pub struct RawPeerDependencyMeta {
+    pub optional: Option<bool>,
+    // Unstructured fields kept for round trip capabilities
     #[deserializable(rest)]
     pub other: BTreeMap<Text, serde_json::Value>,
 }
@@ -129,6 +157,9 @@ impl From<RawPackageJson> for PackageJson {
             peer_dependencies: raw
                 .peer_dependencies
                 .map(|m| m.into_iter().map(|(k, v)| (k, v.into())).collect()),
+            peer_dependencies_meta: raw
+                .peer_dependencies_meta
+                .map(|m| m.into_iter().map(|(k, v)| (k, v.into())).collect()),
             scripts: raw
                 .scripts
                 .into_iter()
@@ -152,6 +183,19 @@ impl From<RawPnpmConfig> for PnpmConfig {
     fn from(raw: RawPnpmConfig) -> Self {
         Self {
             patched_dependencies: raw.patched_dependencies,
+            other: raw
+                .other
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+        }
+    }
+}
+
+impl From<RawPeerDependencyMeta> for PeerDependencyMeta {
+    fn from(raw: RawPeerDependencyMeta) -> Self {
+        Self {
+            optional: raw.optional,
             other: raw
                 .other
                 .into_iter()
@@ -210,6 +254,33 @@ impl PackageJson {
             .chain(self.peer_dependencies.iter().flatten())
     }
 
+    pub fn dependencies_with_kind(
+        &self,
+    ) -> impl Iterator<Item = (&String, &String, DependencyKind)> + '_ {
+        let normal = self
+            .dependencies
+            .iter()
+            .flatten()
+            .chain(self.dev_dependencies.iter().flatten())
+            .chain(self.optional_dependencies.iter().flatten())
+            .map(|(name, version)| (name, version, DependencyKind::Normal));
+        let peer = self.peer_dependencies.iter().flatten().map(|(name, version)| {
+            let optional = self
+                .peer_dependencies_meta
+                .as_ref()
+                .and_then(|meta| meta.get(name))
+                .and_then(|meta| meta.optional)
+                .unwrap_or(false);
+            let kind = if optional {
+                DependencyKind::OptionalPeer
+            } else {
+                DependencyKind::Peer
+            };
+            (name, version, kind)
+        });
+        normal.chain(peer)
+    }
+
     /// Returns the command for script_name if it is non-empty
     pub fn command(&self, script_name: &str) -> Option<&str> {
         self.scripts
@@ -250,6 +321,7 @@ mod test {
     #[test_case(json!({"devDependencies": { "turbo": "latest" }, "foo": "bar"}) ; "dev dependencies")]
     #[test_case(json!({"optionalDependencies": { "turbo": "latest" }, "foo": "bar"}) ; "optional dependencies")]
     #[test_case(json!({"peerDependencies": { "turbo": "latest" }, "foo": "bar"}) ; "peer dependencies")]
+    #[test_case(json!({"peerDependenciesMeta": { "turbo": { "optional": true } }, "foo": "bar"}) ; "peer dependencies meta")]
     #[test_case(json!({"scripts": { "build": "turbo build" }, "foo": "bar"}) ; "scripts")]
     #[test_case(json!({"resolutions": { "turbo": "latest" }, "foo": "bar"}) ; "resolutions")]
     fn test_roundtrip(json: serde_json::Value) {
